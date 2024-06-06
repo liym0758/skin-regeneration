@@ -1,0 +1,257 @@
+setwd("/data/R01/liym223/zzz_projects/skin/lib1-5/")
+
+library(Signac)
+library(Seurat)
+library(tidyverse)
+library(cowplot)
+library(patchwork)
+library(sctransform)
+library(scater)
+library(celda)
+library(DropletUtils)
+library(Matrix)
+library(DoubletFinder)
+set.seed(1234)
+
+library(dplyr)
+library(GenomeInfoDb)
+library(hdf5r)
+library(EnsDb.Hsapiens.v86)
+library(ggplot2)
+library(patchwork)
+library(biovizBase)
+library(utils)
+library(tidyr)
+
+#load("~/zzz_projects/skin/Merged_wound_scar/1010wp.RData")
+
+######################################################################################################
+##############integrate RNA and ATAC#####################
+######################################################################################################
+#### 01 Scar1 lib1
+scar1_filtered_DblRM <- readRDS('/data/R01/liym223/zzz_projects/skin/Merged_wound_scar/scar_filtered_DoubletRM.RDS')
+
+#### 02 wound1 lib2
+wound1_filtered_DblRM <- readRDS('/data/R01/liym223/zzz_projects/skin/Merged_wound_scar/wound_filtered_DoubletRM.RDS')
+
+#### 03 normal lib3
+normal_filtered_DblRM <- readRDS("/data/R01/liym223/zzz_projects/skin/lib34_debug/lib3_debug_filtered_DblRM.RDS")
+
+#### 04 wound2 lib4
+wound2_filtered_DblRM <- readRDS("/data/R01/liym223/zzz_projects/skin/lib34_debug/lib4_debug_filtered_DblRM.RDS")
+
+#### 05 scar2 lib5
+scar2_filtered_DblRM <- readRDS("/data/R01/liym223/zzz_projects/skin/lib1-5/lib5/lib5_filtered_DoubletRM.RDS")
+
+
+setwd(dir = '/data/R01/liym223/zzz_projects/skin/lib1-5/')
+
+# Simply merge Seurat objects
+objList <- list(scar1_filtered_DblRM, scar2_filtered_DblRM, wound1_filtered_DblRM, wound2_filtered_DblRM, normal_filtered_DblRM)
+
+merged_obj <- merge(x=objList[[1]],y=c(objList[[2]],objList[[3]],objList[[4]],objList[[5]]),add.cell.ids = c("scar1","scar2","wound1","wound2","normal"), project = "skin")
+Idents(merged_obj) <- gsub("_.*", "", colnames(merged_obj))
+merged_obj$orig.ident<-Idents(merged_obj)
+lib12345.list <- SplitObject(merged_obj, split.by = "orig.ident")
+
+for (i in 1:length(lib12345.list)) {
+  DefaultAssay(lib12345.list[[i]]) <- "RNA"
+  lib12345.list[[i]] <- SCTransform(lib12345.list[[i]], verbose = FALSE)
+}
+for (i in seq_len(length(lib12345.list))) {
+  DefaultAssay(lib12345.list[[i]]) <- "SCT"
+}
+# lib125.features <- SelectIntegrationFeatures(object.list = lib125.list, nfeatures = 3000)
+# lib125.list <- PrepSCTIntegration(object.list = lib125.list, anchor.features = lib125.features)
+lib12345.features <- SelectIntegrationFeatures(object.list = lib12345.list, nfeatures = 3000)
+lib12345.list <- PrepSCTIntegration(object.list = lib12345.list, anchor.features = lib12345.features)
+
+#integrate RNA using rpca
+lib12345_list <- lapply(
+  X = lib12345.list,
+  FUN = RunPCA,
+  features = lib12345.features,
+  verbose = FALSE
+)
+integration_anchors <- FindIntegrationAnchors(
+  object.list = lib12345_list,
+  normalization.method = "SCT",
+  anchor.features = lib12345.features,
+  dims = 1:30,
+  reduction = "rpca",
+  k.anchor = 20,
+)
+
+lib12345 <- IntegrateData(
+  anchorset = integration_anchors,
+  normalization.method = "SCT",
+  new.assay.name = "integratedRNA",
+  dims = 1:30
+)
+
+#run LSI on new seurat object with integrated RNA assay
+DefaultAssay(lib12345) <- "ATAC"
+lib12345 <- RunTFIDF(lib12345)
+lib12345 <- FindTopFeatures(lib12345, min.cutoff = "q25")
+lib12345 <- RunSVD(lib12345)
+
+pdf("./LSI-depth-correalation.pdf")
+# assess the correlation between each LSI component and sequencing depth using the DepthCor() function
+DepthCor(lib12345)
+dev.off();
+
+#integrate embeddings and output new object to prevent overwriting integrated RNA
+#I can't quite remember why I did this the first time, but it was the work around that I needed
+lib12345_atac <- IntegrateEmbeddings(
+  anchorset = integration_anchors,
+  new.reduction.name = "integratedLSI",
+  reductions = lib12345@reductions$lsi
+)
+
+#copy integrated LSI from duplicate seurat object to original object
+lib12345@reductions$integratedLSI <- lib12345_atac@reductions$integratedLSI
+saveRDS(lib12345,"./Routput/lib12345.RDS")
+#####done integrate ATAC and RNA ################
+
+
+######################## Clustering and annotation  ###################
+#### (1) marker list ####
+Skin_cellType_markers <- read.csv("/data/R01/liym223/zzz_projects/skin/merged_lib1-4/cell_type_annotation/skin_celltype_marker_new.csv", header = T)
+markers_update <- as.vector(Skin_cellType_markers$markers)
+
+Filtered_markers <- read.csv("/data/R01/liym223/zzz_projects/skin/merged_lib1-4/cell_type_annotation/filtered_skin_celltype_marker_new.csv", header = T)
+markers_update2 <- as.vector(Filtered_markers$markers)
+
+########################################################
+#### (2) clustering ####
+# build a joint neighbor graph using both assays
+#We calculate a WNN graph, representing a weighted combination of RNA and ATAC-seq modalities. We use this graph for UMAP visualization and clustering
+DefaultAssay(lib12345) <- "integratedRNA"
+lib12345 <- RunPCA(lib12345, npcs = 50, verbose = FALSE)
+
+# Test FindMultiModalNeighbors dimension setting
+# Selection criteria
+# 1.Cumulative contribution of principal components is greater than 90%
+# 2.PC itself contributes less than 5% to the variance
+# 3.Less than 0.1% difference between two consecutive PCs
+pct <- lib12345[["pca"]]@stdev / sum( lib12345[["pca"]]@stdev) * 100
+# Calculate cumulative percents for each PC 
+cumu <- cumsum(pct) 
+# Determine which PC exhibits cumulative percent greater than 90% and % variation associated with the PC as less than 5 
+co1 <- which(cumu > 90 & pct < 5)[1] 
+co1 #41
+# Determine the difference between variation of PC and subsequent PC 
+co2 <- sort(which((pct[1:length(pct) - 1] - pct[2:length(pct)]) > 0.1), decreasing = T)[1] + 1
+# last point where change of % of variation is more than 0.1%. 
+co2 #16
+# Minimum of the two calculation 
+pcs <- min(co1, co2) 
+pcs #16
+# Create a dataframe with values 
+plot_df <- data.frame(pct = pct, cumu = cumu, rank = 1:length(pct)) 
+# Elbow plot to visualize
+pdf("./Routput/cluster/plotdf_pca.pdf") 
+ggplot(plot_df, aes(cumu, pct, label = rank, color = rank > pcs)) + 
+  geom_text() + 
+  geom_vline(xintercept = 90, color = "grey") + 
+  geom_hline(yintercept = min(pct[pct > 5]), color = "grey") + 
+  theme_bw()
+dev.off()
+
+
+# Dimensional calculations are also performed for lsi
+lst <- lib12345 [["lsi"]]@stdev / sum( lib12345[["lsi"]]@stdev) * 100
+# Calculate cumulative percents for each PC 
+cumu2 <- cumsum(lst) 
+# Determine which PC exhibits cumulative percent greater than 90% and % variation associated with the PC as less than 5 
+co1 <- which(cumu2 > 90 & lst < 5)[1] 
+co1 #39
+# Determine the difference between variation of PC and subsequent PC 
+co2 <- sort(which((lst[1:length(lst) - 1] - lst[2:length(lst)]) > 0.1), decreasing = T)[1] + 1
+# last point where change of % of variation is more than 0.1%. 
+co2 #13
+# Minimum of the two calculation 
+pcs2 <- min(co1, co2) 
+pcs2 #13
+# Create a dataframe with values 
+plot_df2 <- data.frame(pct = lst, cumu = cumu2, rank = 1:length(lst)) 
+# Elbow plot to visualize
+pdf("./Routput/cluster/plotdf_lsi.pdf") 
+ggplot(plot_df2, aes(cumu2, lst, label = rank, color = rank > pcs2)) + 
+  geom_text() + 
+  geom_vline(xintercept = 90, color = "grey") + 
+  geom_hline(yintercept = min(lst[lst > 5]), color = "grey") + 
+  theme_bw()
+dev.off()
+
+lib12345 <- FindMultiModalNeighbors(
+  object = lib12345,
+  reduction.list = list("pca", "integratedLSI"), 
+  dims.list = list(1:16, 2:16), # The dim can usually be adjusted to get better clustering results
+  modality.weight.name = "RNA.weight",
+  verbose = TRUE
+)
+
+lib12345 <- FindNeighbors(object = lib12345, reduction = 'pca', dims = 1:40)
+
+#### (3) clustree ####
+# Use clustree to see which resolution is better
+library(clustree)
+lib12345 <- FindClusters(object = lib12345, verbose = FALSE,algorithm = 3, resolution = c(seq(.1,1.5,.1)))
+#colnames(lib12345@meta.data)
+pdf("./Routput/cluster/clustree_lib12345_unsupervised.pdf",width=14, height=14)
+clustree(lib12345@meta.data, prefix = "integratedRNA_snn_res.")
+dev.off()
+
+lib12345 <- FindClusters(object = lib12345, reduction.type="umap", verbose = FALSE, 
+                            resolution =0.5, algorithm = 3)
+
+# Build a joint UMAP visualization
+lib12345 <- RunUMAP(
+  object = lib12345,
+  nn.name = "weighted.nn",
+  assay = "integratedRNA",
+  verbose = TRUE
+)
+
+######### (4)orig.ident DimPlot #########
+Idents(lib12345)<-lib12345$orig.ident
+lib12345$orig.ident<-factor(lib12345$orig.ident,levels=c("scar1","scar2","wound1","lib3","lib4"))
+
+pdf("./Routput/cluster/lib12345_cluster_splitbysample.pdf",width=15, height=8)
+DimPlot(lib12345, label = TRUE, repel = TRUE, reduction = "umap",split.by = "orig.ident")
+dev.off()
+pdf("./Routput/cluster/lib12345_cluster_sample_consistence.pdf")
+DimPlot(lib12345, label = TRUE, repel = TRUE, reduction = "umap",group.by = "orig.ident")
+DimPlot(lib12345, label = TRUE, repel = TRUE, reduction = "umap",group.by = "seurat_clusters")
+dev.off()
+
+# Save the integrated lib12345 object
+saveRDS(lib12345,"./Routput/lib12345_integrated.RDS")
+
+
+#### (5) compute wnn ####
+# build a joint neighbor graph using both assays
+#We calculate a WNN graph, representing a weighted combination of RNA and ATAC-seq modalities. We use this graph for UMAP visualization and clustering
+
+lib12345 <- RunUMAP(lib12345, nn.name = "weighted.nn", reduction.name = "wnn.umap", reduction.key = "wnnUMAP_")
+lib12345 <- FindClusters(lib12345, graph.name = "wsnn", algorithm = 3, verbose = FALSE)
+
+lib12345 <- FindMultiModalNeighbors(lib12345, reduction.list = list("pca", "lsi"), dims.list = list(1:42, 2:40))
+
+#use wsnn to cluster
+#lib12345$wsnn_res.0.8
+pdf("./Routput/cluster/groupbySNN_wnnumap_res0.8.pdf")
+DimPlot(lib12345, label = TRUE, repel = TRUE, reduction = "umap",group.by = "integratedRNA_snn_res.0.8")
+dev.off()
+#30 clusters
+#get the bubble plot
+pdf("./Routput/cluster/bubbleplot_res0.8.pdf", width=16, height=14)
+DotPlot(lib12345,features = markers_update,assay = 'SCT',group.by = "wsnn_res.0.8")+
+  theme(axis.text.x = element_text(angle = 90,vjust = 0.85,hjust = 0.75))
+dev.off()
+#res=0.8, ?cluster
+#NA markers: IGJ, Cd79A, GLDN5, VMF, CD31, CD45, Cytokeratin-20, NCAM, HLA-DRB, CD56
+
+
+
